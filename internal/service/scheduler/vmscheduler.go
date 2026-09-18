@@ -48,13 +48,48 @@ func (err InsufficientMemoryError) Error() string {
 // It requires the machine's ProxmoxCluster to have at least 1 allowed node.
 func ScheduleVM(ctx context.Context, machineScope *scope.MachineScope) (string, error) {
 	client := machineScope.InfraCluster.ProxmoxClient
-	schedulerHints := machineScope.InfraCluster.ProxmoxCluster.Spec.SchedulerHints
-	locations := machineScope.InfraCluster.ProxmoxCluster.Status.NodeLocations.Workers
+	cluster := machineScope.InfraCluster.ProxmoxCluster
+	schedulerHints := cluster.Spec.SchedulerHints
+	locations := cluster.Status.NodeLocations.Workers
 	if util.IsControlPlaneMachine(machineScope.Machine) {
-		locations = machineScope.InfraCluster.ProxmoxCluster.Status.NodeLocations.ControlPlane
+		locations = cluster.Status.NodeLocations.ControlPlane
 	}
 
-	return selectNode(ctx, client, machineScope.ProxmoxMachine, locations, machineScope.AllowedNodes(), schedulerHints)
+	allowedNodes := machineScope.AllowedNodes()
+	nodeZone := nodeToZone(cluster.Spec.ZoneConfigs, allowedNodes)
+
+	return selectNode(ctx, client, machineScope.ProxmoxMachine, locations, allowedNodes, nodeZone, schedulerHints)
+}
+
+// nodeToZone maps each node to the name of the zone it belongs to. Nodes that
+// aren't part of any configured zone are mapped to themselves, so they're treated
+// as an independent single-node zone for balancing purposes.
+func nodeToZone(zoneConfigs []infrav1.ZoneConfigSpec, nodes []string) map[string]string {
+	result := make(map[string]string, len(nodes))
+	for _, n := range nodes {
+		result[n] = n
+	}
+	for _, zc := range zoneConfigs {
+		zoneName := ptr.Deref(zc.Zone, "")
+		if zoneName == "" {
+			continue
+		}
+		for _, node := range zc.Nodes {
+			if _, ok := result[node]; ok {
+				result[node] = zoneName
+			}
+		}
+	}
+	return result
+}
+
+// zoneOf returns the zone a node belongs to, falling back to the node name itself
+// when it has no entry in nodeZone (e.g. no availability zones are configured).
+func zoneOf(nodeZone map[string]string, node string) string {
+	if zone, ok := nodeZone[node]; ok {
+		return zone
+	}
+	return node
 }
 
 func selectNode(
@@ -63,6 +98,7 @@ func selectNode(
 	machine *infrav1.ProxmoxMachine,
 	locations []infrav1.NodeLocation,
 	allowedNodes []string,
+	nodeZone map[string]string,
 	schedulerHints *infrav1.SchedulerHints,
 ) (string, error) {
 	byMemory := make(sortByAvailableMemory, len(allowedNodes))
@@ -86,14 +122,20 @@ func selectNode(
 		}
 	}
 
-	// count the existing vms per node
+	// count the existing vms per availability zone, so nodes belonging to an already loaded
+	// zone are deprioritized as a group rather than individually. Also count per node so that,
+	// within a multi-node zone, nodes with fewer VMs win the tiebreak instead of falling back
+	// to memory order.
+	zoneCounter := make(map[string]int)
 	nodeCounter := make(map[string]int)
 	for _, nl := range locations {
+		zoneCounter[zoneOf(nodeZone, nl.Node)]++
 		nodeCounter[nl.Node]++
 	}
 
 	for i, info := range byMemory {
-		info.ScheduledVMs = nodeCounter[info.Name]
+		info.ScheduledVMs = zoneCounter[zoneOf(nodeZone, info.Name)]
+		info.NodeVMs = nodeCounter[info.Name]
 		byMemory[i] = info
 	}
 
@@ -131,7 +173,8 @@ type resourceClient interface {
 type nodeInfo struct {
 	Name            string `json:"node"`
 	AvailableMemory uint64 `json:"mem"`
-	ScheduledVMs    int    `json:"vms"`
+	ScheduledVMs    int    `json:"vms"`  // count of VMs in the node's availability zone
+	NodeVMs         int    `json:"nvms"` // count of VMs on this specific node
 }
 
 type sortByReplicas []nodeInfo
@@ -139,7 +182,13 @@ type sortByReplicas []nodeInfo
 func (a sortByReplicas) Len() int      { return len(a) }
 func (a sortByReplicas) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
 func (a sortByReplicas) Less(i, j int) bool {
-	return a[i].ScheduledVMs < a[j].ScheduledVMs
+	// Balance across availability zones first, then across individual nodes within a zone.
+	// Without the node-level tiebreak, every node in a multi-node zone shares the same
+	// ScheduledVMs value, so placement inside the zone degrades to memory order.
+	if a[i].ScheduledVMs != a[j].ScheduledVMs {
+		return a[i].ScheduledVMs < a[j].ScheduledVMs
+	}
+	return a[i].NodeVMs < a[j].NodeVMs
 }
 
 func (a sortByReplicas) String() string {

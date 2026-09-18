@@ -74,7 +74,7 @@ func TestSelectNode(t *testing.T) {
 
 			client := fakeResourceClient(availableMem)
 
-			node, err := selectNode(context.Background(), client, proxmoxMachine, locations, allowedNodes, &infrav1.SchedulerHints{})
+			node, err := selectNode(context.Background(), client, proxmoxMachine, locations, allowedNodes, nil, &infrav1.SchedulerHints{})
 			require.NoError(t, err)
 			require.Equal(t, expectedNode, node)
 
@@ -94,7 +94,7 @@ func TestSelectNode(t *testing.T) {
 
 		client := fakeResourceClient(availableMem)
 
-		node, err := selectNode(context.Background(), client, proxmoxMachine, locations, allowedNodes, &infrav1.SchedulerHints{})
+		node, err := selectNode(context.Background(), client, proxmoxMachine, locations, allowedNodes, nil, &infrav1.SchedulerHints{})
 		require.ErrorAs(t, err, &InsufficientMemoryError{})
 		require.Empty(t, node)
 
@@ -137,7 +137,7 @@ func TestSelectNodeEvenlySpread(t *testing.T) {
 
 			client := fakeResourceClient(availableMem)
 
-			node, err := selectNode(context.Background(), client, proxmoxMachine, locations, allowedNodes, &infrav1.SchedulerHints{})
+			node, err := selectNode(context.Background(), client, proxmoxMachine, locations, allowedNodes, nil, &infrav1.SchedulerHints{})
 			require.NoError(t, err)
 			require.Equal(t, expectedNode, node)
 
@@ -157,7 +157,7 @@ func TestSelectNodeEvenlySpread(t *testing.T) {
 
 		client := fakeResourceClient(availableMem)
 
-		node, err := selectNode(context.Background(), client, proxmoxMachine, locations, allowedNodes, &infrav1.SchedulerHints{})
+		node, err := selectNode(context.Background(), client, proxmoxMachine, locations, allowedNodes, nil, &infrav1.SchedulerHints{})
 		require.ErrorAs(t, err, &InsufficientMemoryError{})
 		require.Empty(t, node)
 
@@ -309,6 +309,84 @@ func TestScheduleVMWithFailureDomainNodes(t *testing.T) {
 	node, err := ScheduleVM(context.Background(), machineScope)
 	require.NoError(t, err)
 	require.Equal(t, "pve3", node)
+}
+
+func TestSelectNodeBalancesAcrossAvailabilityZones(t *testing.T) {
+	// Regression test: az-1 has two nodes, az-2 has one. Without AZ-aware balancing, the
+	// scheduler would spread the first two VMs across pve1a/pve1b (both in az-1) because it
+	// only looked at per-node counts, leaving az-2 empty.
+	allowedNodes := []string{"pve1a", "pve1b", "pve2"}
+	nodeZone := map[string]string{"pve1a": "az-1", "pve1b": "az-1", "pve2": "az-2"}
+	var locations []infrav1.NodeLocation
+	requestMiB := int32(8)
+	availableMem := map[string]uint64{
+		"pve1a": miBytes(100),
+		"pve1b": miBytes(100),
+		"pve2":  miBytes(100),
+	}
+
+	// Expect the second VM to land in az-2 (on pve2) instead of stacking with the first VM's
+	// zone (az-1), even though pve1b is a distinct, equally-available node.
+	expectedZones := []string{"az-1", "az-2", "az-1"}
+
+	for i, expectedZone := range expectedZones {
+		proxmoxMachine := &infrav1.ProxmoxMachine{
+			Spec: infrav1.ProxmoxMachineSpec{MemoryMiB: &requestMiB},
+		}
+		client := fakeResourceClient(availableMem)
+
+		node, err := selectNode(context.Background(), client, proxmoxMachine, locations, allowedNodes, nodeZone, &infrav1.SchedulerHints{})
+		require.NoError(t, err)
+		require.Equalf(t, expectedZone, nodeZone[node], "round %d: node %s", i+1, node)
+
+		availableMem[node] -= miBytes(requestMiB)
+		locations = append(locations, infrav1.NodeLocation{Node: node})
+	}
+}
+
+func TestSelectNodeBalancesNodesWithinAvailabilityZone(t *testing.T) {
+	// Within a multi-node zone, the node-level tiebreak should distribute VMs across nodes
+	// instead of degrading to memory order when all nodes in the zone share the same zone count.
+	allowedNodes := []string{"pve1a", "pve1b"}
+	nodeZone := map[string]string{"pve1a": "az-1", "pve1b": "az-1"}
+	var locations []infrav1.NodeLocation
+	requestMiB := int32(8)
+	availableMem := map[string]uint64{
+		"pve1a": miBytes(100),
+		"pve1b": miBytes(100),
+	}
+
+	// First VM: pve1a has more memory (both at 100, tie -> pve1a by sort stability).
+	// Second VM: both have zone count 1, node count tiebreak picks pve1b.
+	node, err := selectNode(context.Background(), fakeResourceClient(availableMem),
+		&infrav1.ProxmoxMachine{Spec: infrav1.ProxmoxMachineSpec{MemoryMiB: &requestMiB}},
+		locations, allowedNodes, nodeZone, &infrav1.SchedulerHints{})
+	require.NoError(t, err)
+	require.Equal(t, "pve1a", node)
+	locations = append(locations, infrav1.NodeLocation{Node: node})
+
+	node, err = selectNode(context.Background(), fakeResourceClient(availableMem),
+		&infrav1.ProxmoxMachine{Spec: infrav1.ProxmoxMachineSpec{MemoryMiB: &requestMiB}},
+		locations, allowedNodes, nodeZone, &infrav1.SchedulerHints{})
+	require.NoError(t, err)
+	require.Equal(t, "pve1b", node)
+}
+
+func TestNodeToZone(t *testing.T) {
+	zoneA := new("zone-a")
+	zoneB := new("zone-b")
+	zoneConfigs := []infrav1.ZoneConfigSpec{
+		{Zone: zoneA, Nodes: []string{"pve1", "pve2"}},
+		{Zone: zoneB, Nodes: []string{"pve3"}},
+	}
+
+	result := nodeToZone(zoneConfigs, []string{"pve1", "pve2", "pve3", "pve4"})
+	require.Equal(t, map[string]string{
+		"pve1": "zone-a",
+		"pve2": "zone-a",
+		"pve3": "zone-b",
+		"pve4": "pve4", // not in any zone -> maps to itself
+	}, result)
 }
 
 func TestInsufficientMemoryError_Error(t *testing.T) {
